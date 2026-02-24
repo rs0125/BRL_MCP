@@ -1,8 +1,11 @@
 import asyncio
 import os
+from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.prebuilt import create_react_agent
+
+load_dotenv()
 
 async def run_agent():
     # 1. Verify the API Key exists in the environment

@@ -1,11 +1,15 @@
+import os
 import socket
+from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, Field
 
+load_dotenv()
+
 mcp = FastMCP("BRL-CAD-Structured-Agent")
 
-BRLCAD_HOST = "127.0.0.1"
-BRLCAD_PORT = 5555
+BRLCAD_HOST = os.getenv("BRLCAD_HOST", "127.0.0.1")
+BRLCAD_PORT = int(os.getenv("BRLCAD_PORT", "5555"))
 
 def send_to_brlcad(cmd: str) -> str:
     """Helper function to talk to the Tcl socket."""
