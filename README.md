@@ -33,23 +33,15 @@ The system is built on three layers:
 
 ## Architecture
 
-```
-+-------------------+       stdio        +-------------------+      TCP/5555      +-------------------+
-|                   | ----------------->  |                   | ----------------->  |                   |
-|   client.py       |                    |   mcp_server.py   |                    |   listener.tcl    |
-|   (LangGraph      |  MCP Protocol      |   (FastMCP Tool   |  Raw MGED         |   (BRL-CAD MGED   |
-|    ReAct Agent)   | <-----------------  |    Server)        | <-----------------  |    Socket Bridge) |
-|                   |                    |                   |                    |                   |
-+-------------------+                    +-------------------+                    +-------------------+
-        |                                                                                  |
-        | User prompt                                                              MGED commands
-        v                                                                          evaluated live
-   Terminal CLI                                                                  in BRL-CAD session
-```
+The system is composed of three layers that communicate in a chain:
 
-- **client.py** spawns `mcp_server.py` as a subprocess and communicates over stdio using the MCP protocol.
-- **mcp_server.py** opens a TCP connection to `listener.tcl` for each tool invocation.
-- **listener.tcl** evaluates MGED commands inside BRL-CAD and returns results over the socket.
+- **Client** (`client/agent.py`) — A LangGraph ReAct agent that takes natural-language input from the user, reasons about the request, and decides which MCP tool(s) to call. It spawns the MCP server as a subprocess and talks to it over **stdio**.
+
+- **Server** (`server/app.py` + `server/tools/*`) — A FastMCP tool server that exposes typed, validated geometry operations (sphere, cylinder, box, booleans, etc.). When a tool is invoked, it builds the corresponding MGED command and sends it to BRL-CAD over a **TCP** connection (port 5555) via the transport layer (`transport/socket_bridge.py`).
+
+- **Bridge** (`scripts/listener.tcl`) — A lightweight Tcl script sourced inside BRL-CAD's MGED session. It listens on a TCP socket, evaluates incoming MGED commands, and returns the result.
+
+**Request lifecycle:** User prompt → Agent selects tool → MCP server builds MGED command → TCP socket → Tcl listener evaluates in MGED → result flows back through the same chain.
 
 ---
 
@@ -78,11 +70,13 @@ The system is built on three layers:
    source .venv/bin/activate
    ```
 
-3. **Install Python dependencies:**
+3. **Install the package (editable mode recommended for development):**
 
    ```bash
-   pip install langchain-openai langchain-mcp-adapters langgraph mcp python-dotenv pydantic
+   pip install -e ".[dev]"
    ```
+
+   This installs all runtime and development dependencies defined in `pyproject.toml`.
 
 4. **Configure environment variables:**
 
@@ -105,6 +99,9 @@ All configuration is managed through a `.env` file in the project root. A templa
 | `OPENAI_TEMPERATURE`  | Sampling temperature (0 = deterministic)     | `0`           |
 | `BRLCAD_HOST`         | Hostname where the Tcl listener is running   | `127.0.0.1`   |
 | `BRLCAD_PORT`         | TCP port for the Tcl socket bridge           | `5555`        |
+| `BRLCAD_TIMEOUT`      | Socket timeout in seconds                    | `2.0`         |
+| `BRLCAD_BUFFER_SIZE`  | TCP receive buffer size in bytes             | `4096`        |
+| `MCP_TRANSPORT`       | MCP transport type                           | `stdio`       |
 
 **Important:** Never commit your `.env` file. It is already included in `.gitignore`.
 
@@ -123,7 +120,7 @@ mged my_model.g
 Inside the MGED console:
 
 ```tcl
-source /path/to/brlcad-mcp/listener.tcl
+source /path/to/brlcad-mcp/scripts/listener.tcl
 ```
 
 You should see:
@@ -141,14 +138,20 @@ In a separate terminal, activate the virtual environment and start the client:
 
 ```bash
 source .venv/bin/activate
-python client.py
+brlcad-mcp chat
+```
+
+Or equivalently:
+
+```bash
+python -m brlcad_mcp chat
 ```
 
 You should see:
 
 ```
 Starting local MCP Client...
-Successfully loaded 2 tools from BRL-CAD!
+Successfully loaded 4 tool(s) from BRL-CAD!
 
 =================================================
  BRL-CAD Terminal Agent Active. Type 'exit' to quit.
@@ -185,6 +188,35 @@ Creates a solid sphere primitive in BRL-CAD.
 | `z`       | float   | Z coordinate of the center          |
 | `radius`  | float   | Radius of the sphere                |
 
+### `create_cylinder`
+
+Creates a right circular cylinder (RCC) in BRL-CAD.
+
+| Parameter   | Type   | Description                            |
+|-------------|--------|----------------------------------------|
+| `name`      | string | Name of the cylinder (e.g., `tube.s`)  |
+| `base_x`    | float  | X coordinate of the base center        |
+| `base_y`    | float  | Y coordinate of the base center        |
+| `base_z`    | float  | Z coordinate of the base center        |
+| `height_x`  | float  | X component of the height vector       |
+| `height_y`  | float  | Y component of the height vector       |
+| `height_z`  | float  | Z component of the height vector       |
+| `radius`    | float  | Radius of the cylinder                 |
+
+### `create_box`
+
+Creates an axis-aligned box (RPP) in BRL-CAD.
+
+| Parameter | Type   | Description               |
+|-----------|--------|---------------------------|
+| `name`    | string | Name of the box            |
+| `x_min`   | float  | Minimum X coordinate       |
+| `y_min`   | float  | Minimum Y coordinate       |
+| `z_min`   | float  | Minimum Z coordinate       |
+| `x_max`   | float  | Maximum X coordinate       |
+| `y_max`   | float  | Maximum Y coordinate       |
+| `z_max`   | float  | Maximum Z coordinate       |
+
 ### `boolean_combination`
 
 Performs a CSG boolean operation to combine two existing objects.
@@ -200,38 +232,44 @@ Performs a CSG boolean operation to combine two existing objects.
 
 ## Adding New Tools
 
-The system is designed so that the agent client (`client.py`) never needs modification when new tools are added. Tools are discovered dynamically at startup via the MCP protocol.
+The system is designed so that the agent client never needs modification when new tools are added. Tools are discovered dynamically at startup via the MCP protocol.
 
 To add a new tool:
 
-1. Open `mcp_server.py`.
+1. Choose the appropriate file under `src/brlcad_mcp/server/tools/` (or create a new module for a new category).
 2. Define a new function decorated with `@mcp.tool()`.
 3. Use Pydantic `Field` annotations for all parameters to provide type-safe descriptions for the LLM.
-4. Construct the appropriate MGED command string and send it through `send_to_brlcad()`.
+4. Construct the appropriate MGED command string and send it through `send_command()`.
 
-**Example -- adding a cylinder tool:**
+**Example -- adding a cone tool to `primitives.py`:**
 
 ```python
+from pydantic import Field
+
+from brlcad_mcp.server.app import mcp
+from brlcad_mcp.transport import send_command
+
 @mcp.tool()
-def create_cylinder(
-    name: str = Field(..., description="Name of the cylinder, e.g., 'tube.s'"),
+def create_cone(
+    name: str = Field(..., description="Name of the cone, e.g., 'cone.s'"),
     base_x: float = Field(..., description="X coordinate of the base center"),
     base_y: float = Field(..., description="Y coordinate of the base center"),
     base_z: float = Field(..., description="Z coordinate of the base center"),
     height_x: float = Field(..., description="X component of the height vector"),
     height_y: float = Field(..., description="Y component of the height vector"),
     height_z: float = Field(..., description="Z component of the height vector"),
-    radius: float = Field(..., description="Radius of the cylinder")
+    base_radius: float = Field(..., description="Radius at the base"),
+    top_radius: float = Field(..., description="Radius at the top"),
 ) -> str:
-    """Creates a right circular cylinder (RCC) in BRL-CAD."""
-    cmd = f"in {name} rcc {base_x} {base_y} {base_z} {height_x} {height_y} {height_z} {radius}"
-    result = send_to_brlcad(cmd)
-    send_to_brlcad(f"draw {name}")
-    send_to_brlcad("autoview")
-    return f"Created cylinder {name}. Output: {result}"
+    """Creates a truncated general cone (TGC) in BRL-CAD."""
+    cmd = f"in {name} tgc {base_x} {base_y} {base_z} {height_x} {height_y} {height_z} {base_radius} {top_radius}"
+    result = send_command(cmd)
+    send_command(f"draw {name}")
+    send_command("autoview")
+    return f"Created cone '{name}'. Output: {result}"
 ```
 
-The next time `client.py` is started, the agent will automatically discover and be able to use the new tool.
+If you create a new tool module (e.g., `transforms.py`), import it in `src/brlcad_mcp/server/tools/__init__.py` to ensure it gets registered.
 
 ---
 
@@ -239,16 +277,43 @@ The next time `client.py` is started, the agent will automatically discover and 
 
 ```
 brlcad-mcp/
-|-- client.py          # LangGraph ReAct agent with interactive CLI
-|-- mcp_server.py      # FastMCP tool server exposing BRL-CAD operations
-|-- listener.tcl       # Tcl socket bridge sourced inside BRL-CAD MGED
-|-- .env               # Local environment configuration (not committed)
-|-- .env.example       # Template for environment variables
-|-- .gitignore         # Git ignore rules
+├── src/
+│   └── brlcad_mcp/
+│       ├── __init__.py              # Package metadata and version
+│       ├── __main__.py              # python -m brlcad_mcp entry point
+│       ├── cli.py                   # CLI argument parsing (serve / chat)
+│       ├── config.py                # Centralised settings from env / .env
+│       ├── client/
+│       │   ├── __init__.py
+│       │   └── agent.py             # LangGraph ReAct agent + chat loop
+│       ├── server/
+│       │   ├── __init__.py
+│       │   ├── app.py               # FastMCP application instance
+│       │   └── tools/
+│       │       ├── __init__.py      # Auto-imports tool modules
+│       │       ├── primitives.py    # Sphere, cylinder, box, …
+│       │       └── boolean.py       # CSG boolean operations
+│       └── transport/
+│           ├── __init__.py
+│           └── socket_bridge.py     # TCP socket comms to BRL-CAD
+├── scripts/
+│   └── listener.tcl                 # Tcl socket bridge for BRL-CAD MGED
+├── tests/
+│   ├── __init__.py
+│   ├── test_config.py
+│   ├── test_transport.py
+│   └── test_tools.py
+├── .env.example                     # Template for environment variables
+├── .gitignore
+├── pyproject.toml                   # PEP 621 packaging + tool config
+├── LICENSE
+└── README.md
 ```
 
 ---
 
 ## License
 
-This project is provided as-is for educational and research purposes. See the BRL-CAD project for its own licensing terms (LGPL 2.1).
+This project is licensed under the [MIT License](LICENSE).
+
+BRL-CAD itself is licensed separately under the LGPL 2.1 — see the [BRL-CAD project](https://brlcad.org/) for details.
